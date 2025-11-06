@@ -25,4 +25,10 @@ SECTIONS {
     . = ALIGN(4);
     . += 128 * 1024; /* 128KB */
     __stack_top = .;
+
+    /* Fixed free RAM window for allocator tests */
+    . = 0x80221000;
+    __free_ram = .;
+    . = 0x84221000;
+    __free_ram_end = .;
 }

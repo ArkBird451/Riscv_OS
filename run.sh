@@ -1,5 +1,5 @@
 #!/bin/bash
-set -xue
+set -ue
 
 QEMU=qemu-system-riscv32
 

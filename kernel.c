@@ -58,8 +58,13 @@ void kernel_entry(void) {
         "sw s10, 4 * 28(sp)\n"
         "sw s11, 4 * 29(sp)\n"
 
+        //Retreive and save the sp at the time of exception.
         "csrr a0, sscratch\n"
         "sw a0, 4 * 30(sp)\n"
+
+        // Reset the kernel stack.
+        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, a0\n"
 
         "mv a0, sp\n"
         "call handle_trap\n"
@@ -223,12 +228,13 @@ void delay(void) {
 struct process *proc_a;
 struct process *proc_b;
 
+void yield(void);
+
 void proc_a_entry(void) {
     printf("starting process A\n");
     while (1) {
         putchar('A');
-        switch_context(&proc_a->sp, &proc_b->sp);
-        delay();
+        yield();
     }
 }
 
@@ -236,19 +242,52 @@ void proc_b_entry(void) {
     printf("starting process B\n");
     while (1) {
         putchar('B');
-        switch_context(&proc_b->sp, &proc_a->sp);
-        delay();
+        yield();
     }
+}
+
+struct process *current_proc;
+struct process *idle_proc;
+
+void yield(void) {
+    struct process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+         struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+         if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+         }
+    } 
+    // If there's no runnable process other than the current one, return and continue processing
+    if (next == current_proc)
+        return;
+
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
+    // Context switch
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
 }
 
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
+    printf("\n\n");
+
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
+
+    idle_proc = create_process((uint32_t) NULL);
+    idle_proc->pid = 0; // idle
+    current_proc = idle_proc;
 
     proc_a = create_process((uint32_t) proc_a_entry);
     proc_b = create_process((uint32_t) proc_b_entry);
-    proc_a_entry();
 
-    PANIC("unreachable here!");
+    yield();
+    PANIC("switched to idle process");
 }

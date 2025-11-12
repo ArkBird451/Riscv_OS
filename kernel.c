@@ -147,6 +147,7 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
 }
 
 void handle_trap(struct trap_frame *f) {
+    (void) f;
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
     uint32_t sepc = READ_CSR(sepc);
@@ -326,6 +327,9 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
     table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
 }
 
+extern char _binary_shell_bin_start[];
+extern char _binary_shell_bin_size[];
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
@@ -333,6 +337,10 @@ void kernel_main(void) {
 
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
     WRITE_CSR(sscratch, (uint32_t) __stack_top);
+
+    uint8_t *shell_bin = (uint8_t *) _binary_shell_bin_start;
+    printf("shell_bin size = %d\n", (int) _binary_shell_bin_size);
+    printf("shell_bin[0] = %x\n", shell_bin[0]);
 
     idle_proc = create_process((uint32_t) idle_entry);
     idle_proc->pid = 0;

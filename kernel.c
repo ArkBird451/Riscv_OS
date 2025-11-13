@@ -147,20 +147,38 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
 }
 
 void handle_trap(struct trap_frame *f) {
-    (void) f;
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
     uint32_t sepc = READ_CSR(sepc);
 
-    if ((scause & 0x1fff) == 2) { // illegal instruction
-        uint16_t half = *(uint16_t *) sepc;
-        uint32_t instr_len = ((half & 0x3) != 0x3) ? 2 : 4; // C-ext vs 32-bit
-        printf("illegal instruction at %x (stval=%x), skipping %d bytes\n", sepc, stval, instr_len);
-        WRITE_CSR(sepc, sepc + instr_len);
+    if ((scause & 0x1fff) == 8) { // Environment call from U-mode
+        // System call from user mode
+        if (f->a7 == 1) { // SBI console putchar
+            sbi_call(f->a0, 0, 0, 0, 0, 0, 0, 1);
+        }
+        
+        // Move past the ecall instruction (4 bytes)
+        WRITE_CSR(sepc, sepc + 4);
         return;
     }
 
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, sepc);
+    if ((scause & 0x1fff) == 2) { // illegal instruction
+        PANIC("Illegal instruction at %x", sepc);
+    }
+
+    if ((scause & 0x1fff) == 12) { // Instruction page fault
+        PANIC("Instruction page fault at %x, addr=%x", sepc, stval);
+    }
+
+    if ((scause & 0x1fff) == 13) { // Load page fault
+        PANIC("Load page fault at %x, addr=%x", sepc, stval);
+    }
+
+    if ((scause & 0x1fff) == 15) { // Store/AMO page fault
+        PANIC("Store page fault at %x, addr=%x", sepc, stval);
+    }
+
+    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x", scause, stval, sepc);
 }
 
 void putchar(char ch) {
@@ -189,20 +207,43 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+
 struct process procs[PROCS_MAX];
 
 extern char __kernel_base[];
 
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
 
+void user_entry(void) {
+    // Set SPIE (enable interrupts) and clear SPP (return to user mode)
+    uint32_t sstatus = READ_CSR(sstatus);
+    sstatus |= SSTATUS_SPIE;   // Enable interrupts in user mode
+    sstatus &= ~SSTATUS_SPP;   // Clear SPP to return to user mode (U-mode)
+    
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]\n"
+        "csrw sstatus, %[sstatus]\n"
+        "sret\n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (sstatus)
+    );
+    
+    __builtin_unreachable();
+}
+
 struct process *create_process(uint32_t pc) {
+    // Map kernel pages (identity mapping: VA = PA)
     uint32_t *page_table = (uint32_t *) alloc_pages(1);
     
+    // Map kernel code/data region
     for (paddr_t paddr = (paddr_t) __kernel_base;
          paddr < (paddr_t) __free_ram; paddr += PAGE_SIZE) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
     }
     
+    // Map allocated portion of free RAM (with some buffer for safety)
     paddr_t alloc_end = alloc_pages_get_allocated_end();
     paddr_t map_end = alloc_end + 4 * 1024 * 1024;
     if (map_end > (paddr_t) __free_ram_end)
@@ -213,6 +254,7 @@ struct process *create_process(uint32_t pc) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
     }
 
+    // Find an unused process slot
     struct process *proc = NULL;
     int i;
     for (i = 0; i < PROCS_MAX; i++) {
@@ -225,20 +267,93 @@ struct process *create_process(uint32_t pc) {
     if (!proc)
         PANIC("no free process slots");
 
+    // Initialize the process stack
     uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = 0;
-    *--sp = (uint32_t) pc;
+    *--sp = 0;                      // s11
+    *--sp = 0;                      // s10
+    *--sp = 0;                      // s9
+    *--sp = 0;                      // s8
+    *--sp = 0;                      // s7
+    *--sp = 0;                      // s6
+    *--sp = 0;                      // s5
+    *--sp = 0;                      // s4
+    *--sp = 0;                      // s3
+    *--sp = 0;                      // s2
+    *--sp = 0;                      // s1
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) pc;          // ra
+
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
+    return proc;
+}
+
+struct process *create_process_from_elf(const void *image, size_t image_size) {
+    // Map kernel pages (identity mapping: VA = PA)
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    
+    // Map kernel code/data region
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram; paddr += PAGE_SIZE) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    // Map user pages.
+    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+        paddr_t page = alloc_pages(1);
+
+        // Handle the case where the data to be copied is smaller than the
+        // page size.
+        size_t remaining = image_size - off;
+        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+        // Fill and map the page.
+        memcpy((void *) page, image + off, copy_size);
+        map_page(page_table, USER_BASE + off, page,
+                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+    }
+    
+    // Map allocated portion of free RAM (with some buffer for safety)
+    paddr_t alloc_end = alloc_pages_get_allocated_end();
+    paddr_t map_end = alloc_end + 4 * 1024 * 1024;
+    if (map_end > (paddr_t) __free_ram_end)
+        map_end = (paddr_t) __free_ram_end;
+    
+    for (paddr_t paddr = (paddr_t) __free_ram;
+         paddr < map_end; paddr += PAGE_SIZE) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    // Find an unused process slot
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slots");
+
+    // Initialize the process stack
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    *--sp = 0;                      // s11
+    *--sp = 0;                      // s10
+    *--sp = 0;                      // s9
+    *--sp = 0;                      // s8
+    *--sp = 0;                      // s7
+    *--sp = 0;                      // s6
+    *--sp = 0;                      // s5
+    *--sp = 0;                      // s4
+    *--sp = 0;                      // s3
+    *--sp = 0;                      // s2
+    *--sp = 0;                      // s1
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) user_entry;  // ra
 
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
@@ -338,17 +453,12 @@ void kernel_main(void) {
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
     WRITE_CSR(sscratch, (uint32_t) __stack_top);
 
-    uint8_t *shell_bin = (uint8_t *) _binary_shell_bin_start;
-    printf("shell_bin size = %d\n", (int) _binary_shell_bin_size);
-    printf("shell_bin[0] = %x\n", shell_bin[0]);
-
     idle_proc = create_process((uint32_t) idle_entry);
     idle_proc->pid = 0;
     current_proc = idle_proc;
-
-    proc_a = create_process((uint32_t) proc_a_entry);
-    proc_b = create_process((uint32_t) proc_b_entry);
-
+    
+    create_process_from_elf(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+    
     yield();
     PANIC("switched to idle process");
 }

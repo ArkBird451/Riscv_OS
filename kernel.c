@@ -149,7 +149,7 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
-    uint32_t sepc = READ_CSR(sepc);
+    uint32_t user_pc = READ_CSR(sepc);
 
     if ((scause & 0x1fff) == 8) { // Environment call from U-mode
         // System call from user mode
@@ -157,28 +157,29 @@ void handle_trap(struct trap_frame *f) {
             sbi_call(f->a0, 0, 0, 0, 0, 0, 0, 1);
         }
         
-        // Move past the ecall instruction (4 bytes)
-        WRITE_CSR(sepc, sepc + 4);
+        // Move past the ecall instruction (4 bytes)  
+        user_pc += 4;
+        WRITE_CSR(sepc, user_pc);
         return;
     }
 
     if ((scause & 0x1fff) == 2) { // illegal instruction
-        PANIC("Illegal instruction at %x", sepc);
+        PANIC("Illegal instruction at %x", user_pc);
     }
 
     if ((scause & 0x1fff) == 12) { // Instruction page fault
-        PANIC("Instruction page fault at %x, addr=%x", sepc, stval);
+        PANIC("Instruction page fault at %x, addr=%x", user_pc, stval);
     }
 
     if ((scause & 0x1fff) == 13) { // Load page fault
-        PANIC("Load page fault at %x, addr=%x", sepc, stval);
+        PANIC("Load page fault at %x, addr=%x", user_pc, stval);
     }
 
     if ((scause & 0x1fff) == 15) { // Store/AMO page fault
-        PANIC("Store page fault at %x, addr=%x", sepc, stval);
+        PANIC("Store page fault at %x, addr=%x", user_pc, stval);
     }
 
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x", scause, stval, sepc);
+    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x", scause, stval, user_pc);
 }
 
 void putchar(char ch) {

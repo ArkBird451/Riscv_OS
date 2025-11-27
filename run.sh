@@ -18,6 +18,14 @@ $OBJCOPY -Ibinary -Oelf32-littleriscv shell.bin shell.bin.o
 $CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
       boot.S kernel.c common.c shell.bin.o
 
+# Create a disk image if it doesn't exist
+if [ ! -f disk.img ]; then
+    echo "Creating disk image..."
+    dd if=/dev/zero of=disk.img bs=1M count=32 2>/dev/null
+fi
+
 # Start QEMU
 $QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \
-    -kernel kernel.elf
+    -kernel kernel.elf \
+    -drive id=drive0,if=none,file=disk.img,format=raw \
+    -device virtio-blk-device,drive=drive0

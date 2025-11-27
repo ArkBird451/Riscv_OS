@@ -446,6 +446,176 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
 extern char _binary_shell_bin_start[];
 extern char _binary_shell_bin_size[];
 
+// Global virtio-blk state pointers
+struct virtio_virtq *blk_request_vq;
+struct virtio_blk_req *blk_req;
+paddr_t blk_req_paddr;
+
+// Store capacity in a location that won't be overwritten
+struct {
+    unsigned capacity;
+} blk_state;
+
+// Helper functions to read/write virtio MMIO registers
+static uint32_t virtio_reg_read32(unsigned offset) {
+    return *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+static uint64_t virtio_reg_read64(unsigned offset) {
+    return *((volatile uint64_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+static void virtio_reg_write32(unsigned offset, uint32_t value) {
+    *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+static void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value) {
+    virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+// Initialize virtio-blk device
+struct virtio_virtq *virtq_init(unsigned index) {
+    paddr_t virtq_paddr = alloc_pages(align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+    struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
+    vq->queue_index = index;
+    vq->used_index = (volatile uint16_t *) &vq->used.index;
+    
+    // Select the queue
+    virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+    
+    // Check if queue is available
+    if (virtio_reg_read32(VIRTIO_REG_QUEUE_NUM_MAX) == 0) {
+        PANIC("virtqueue #%d does not exist", index);
+    }
+    
+    // Set queue size
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+    
+    // Set queue address (page-aligned physical address)
+    virtio_reg_write32(VIRTIO_REG_QUEUE_ALIGN, 0);
+    virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr);
+    
+    return vq;
+}
+
+// Add a descriptor to the virtqueue
+void virtq_kick(struct virtio_virtq *vq, int desc_index) {
+    // Add to available ring
+    vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+    vq->avail.index++;
+    
+    // Memory barrier
+    __asm__ __volatile__("fence rw, rw" ::: "memory");
+    
+    // Notify device
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+    
+    // Wait for completion
+    while (vq->last_used_index == *vq->used_index) {
+        // Busy wait
+    }
+    
+    vq->last_used_index++;
+}
+
+// Initialize virtio-blk driver
+void virtio_blk_init(void) {
+    // Check magic value
+    if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976) {
+        PANIC("virtio: invalid magic value");
+    }
+    
+    // Check device version
+    if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1) {
+        PANIC("virtio: unsupported version");
+    }
+    
+    // Check device ID (should be 2 for block device)
+    if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK) {
+        PANIC("virtio: not a block device");
+    }
+    
+    // Reset device
+    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+    
+    // Acknowledge device
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+    
+    // Set DRIVER status
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+    
+    // Read device capacity and store in struct
+    blk_state.capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+    printf("virtio-blk: capacity is %d bytes\n", blk_state.capacity);
+    
+    // Initialize request virtqueue
+    blk_request_vq = virtq_init(0);
+    
+    // Set FEATURES_OK
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_FEAT_OK);
+    
+    // Set DRIVER_OK
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+    
+    // Allocate request buffer
+    blk_req_paddr = alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+    blk_req = (struct virtio_blk_req *) blk_req_paddr;
+    
+    printf("virtio-blk: initialized successfully\n");
+}
+
+// Read a sector from the block device
+void read_write_disk(void *buf, unsigned sector, int is_write) {
+    if (sector >= blk_state.capacity / SECTOR_SIZE) {
+        printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
+               sector, blk_state.capacity / SECTOR_SIZE);
+        return;
+    }
+    
+    // Setup request header
+    blk_req->sector = sector;
+    blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    
+    // Copy data if writing
+    if (is_write) {
+        memcpy(blk_req->data, buf, SECTOR_SIZE);
+    }
+    
+    // Setup descriptors
+    // Descriptor 0: request header
+    blk_request_vq->descs[0].addr = blk_req_paddr;
+    blk_request_vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+    blk_request_vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
+    blk_request_vq->descs[0].next = 1;
+    
+    // Descriptor 1: data buffer
+    blk_request_vq->descs[1].addr = blk_req_paddr + offsetof(struct virtio_blk_req, data);
+    blk_request_vq->descs[1].len = SECTOR_SIZE;
+    blk_request_vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
+    blk_request_vq->descs[1].next = 2;
+    
+    // Descriptor 2: status byte
+    blk_request_vq->descs[2].addr = blk_req_paddr + offsetof(struct virtio_blk_req, status);
+    blk_request_vq->descs[2].len = sizeof(uint8_t);
+    blk_request_vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
+    blk_request_vq->descs[2].next = 0;
+    
+    // Kick the queue
+    virtq_kick(blk_request_vq, 0);
+    
+    // Check status
+    if (blk_req->status != 0) {
+        printf("virtio: warn: failed to read/write sector=%d status=%d\n",
+               sector, blk_req->status);
+        return;
+    }
+    
+    // Copy data if reading
+    if (!is_write) {
+        memcpy(buf, blk_req->data, SECTOR_SIZE);
+    }
+}
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
@@ -453,6 +623,31 @@ void kernel_main(void) {
 
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
     WRITE_CSR(sscratch, (uint32_t) __stack_top);
+
+    // Initialize virtio-blk driver
+    virtio_blk_init();
+    
+    // Test: Write and read back data
+    printf("Testing disk I/O...\n");
+    
+    char write_buf[SECTOR_SIZE];
+    char read_buf[SECTOR_SIZE];
+    
+    // Write test data
+    strcpy(write_buf, "Hello from virtio-blk!");
+    printf("Writing: %s\n", write_buf);
+    read_write_disk(write_buf, 0, 1);  // Write to sector 0
+    
+    // Read back
+    memset(read_buf, 0, SECTOR_SIZE);
+    read_write_disk(read_buf, 0, 0);  // Read from sector 0
+    printf("Read back: %s\n", read_buf);
+    
+    if (strcmp(write_buf, read_buf) == 0) {
+        printf("Disk I/O test: OK\n");
+    } else {
+        printf("Disk I/O test: FAILED\n");
+    }
 
     idle_proc = create_process((uint32_t) idle_entry);
     idle_proc->pid = 0;

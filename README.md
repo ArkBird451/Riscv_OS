@@ -134,7 +134,4 @@ echo "Your content" > fs_contents/myfile.txt
 
 Based on the "Operating System in 1,000 Lines" project by Seiya Nuta.
 
-## License
-
-Educational use only.
 

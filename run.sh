@@ -18,11 +18,16 @@ $OBJCOPY -Ibinary -Oelf32-littleriscv shell.bin shell.bin.o
 $CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
       boot.S kernel.c common.c shell.bin.o
 
-# Create a disk image if it doesn't exist
-if [ ! -f disk.img ]; then
-    echo "Creating disk image..."
-    dd if=/dev/zero of=disk.img bs=1M count=32 2>/dev/null
-fi
+# Create test files for tar archive
+mkdir -p fs_contents
+echo "Hello from the tar file system!" > fs_contents/hello.txt
+echo "This is a test file." > fs_contents/test.txt
+echo "This is another file for testing." > fs_contents/another.txt
+
+# Create tar archive and write to disk image
+echo "Creating tar archive..."
+(cd fs_contents && tar cf ../disk.img --format=ustar *)
+echo "Tar archive created successfully"
 
 # Start QEMU
 $QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \

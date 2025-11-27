@@ -153,8 +153,26 @@ void handle_trap(struct trap_frame *f) {
 
     if ((scause & 0x1fff) == 8) { // Environment call from U-mode
         // System call from user mode
-        if (f->a7 == 1) { // SBI console putchar
-            sbi_call(f->a0, 0, 0, 0, 0, 0, 0, 1);
+        switch (f->a7) {
+            case SYS_PUTCHAR: // putchar
+                sbi_call(f->a0, 0, 0, 0, 0, 0, 0, 1);
+                break;
+            
+            case SYS_READFILE: { // readfile(filename, buf, size)
+                const char *filename = (const char *)f->a0;
+                char *buf = (char *)f->a1;
+                int size = (int)f->a2;
+                fs_read_file(filename, buf, size);
+                break;
+            }
+            
+            case SYS_LISTDIR: // listdir()
+                fs_list_files();
+                break;
+            
+            default:
+                printf("Unknown syscall: %d\n", f->a7);
+                break;
         }
         
         // Move past the ecall instruction (4 bytes)  
@@ -299,6 +317,11 @@ struct process *create_process_from_elf(const void *image, size_t image_size) {
     for (paddr_t paddr = (paddr_t) __kernel_base;
          paddr < (paddr_t) __free_ram; paddr += PAGE_SIZE) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+    
+    // Map virtio MMIO region for device access during syscalls
+    for (paddr_t paddr = 0x10000000; paddr < 0x10010000; paddr += PAGE_SIZE) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W);
     }
 
     // Map user pages.
@@ -445,6 +468,139 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
 
 extern char _binary_shell_bin_start[];
 extern char _binary_shell_bin_size[];
+
+// Forward declarations
+void read_write_disk(void *buf, unsigned sector, int is_write);
+
+// Tar file system implementation
+static char disk_buf[SECTOR_SIZE];
+
+// Convert octal string to integer (used for tar header fields)
+static unsigned oct2int(const char *oct, int len) {
+    unsigned value = 0;
+    for (int i = 0; i < len && oct[i] >= '0' && oct[i] <= '7'; i++) {
+        value = value * 8 + (oct[i] - '0');
+    }
+    return value;
+}
+
+// Initialize tar file system
+void fs_init(void) {
+    printf("Initializing tar file system...\n");
+}
+
+// List all files in the tar archive
+void fs_list_files(void) {
+    printf("Files in tar archive:\n");
+    
+    unsigned sector = 0;
+    for (;;) {
+        // Read sector
+        read_write_disk(disk_buf, sector, 0);
+        struct tar_header *header = (struct tar_header *) disk_buf;
+        
+        // Check if end of archive (empty block)
+        if (header->name[0] == '\0') {
+            break;
+        }
+        
+        // Parse file size
+        unsigned file_size = oct2int(header->size, sizeof(header->size));
+        
+        // Print file info
+        printf("  %s (%d bytes)\n", header->name, file_size);
+        
+        // Move to next file (header + data blocks, rounded up to 512 bytes)
+        unsigned data_sectors = (file_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        sector += 1 + data_sectors;
+    }
+}
+
+// Find a file in the tar archive
+struct tar_header *fs_lookup(const char *filename) {
+    static char lookup_buf[SECTOR_SIZE];
+    
+    unsigned sector = 0;
+    for (;;) {
+        // Read sector
+        read_write_disk(lookup_buf, sector, 0);
+        struct tar_header *header = (struct tar_header *) lookup_buf;
+        
+        // Check if end of archive
+        if (header->name[0] == '\0') {
+            return NULL;
+        }
+        
+        // Check if filename matches
+        if (strcmp(header->name, filename) == 0) {
+            return header;
+        }
+        
+        // Move to next file
+        unsigned file_size = oct2int(header->size, sizeof(header->size));
+        unsigned data_sectors = (file_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        sector += 1 + data_sectors;
+    }
+}
+
+// Read a file from the tar archive
+void fs_read_file(const char *filename, char *buf, int size) {
+    // Find file
+    struct tar_header *header = fs_lookup(filename);
+    if (!header) {
+        printf("File not found: %s\n", filename);
+        return;
+    }
+    
+    // Get file size
+    unsigned file_size = oct2int(header->size, sizeof(header->size));
+    if (file_size > (unsigned)size) {
+        printf("Buffer too small for file: %s\n", filename);
+        return;
+    }
+    
+    // Find the sector where this file's data starts
+    // We need to search again to get the correct sector number
+    unsigned sector = 0;
+    for (;;) {
+        read_write_disk(disk_buf, sector, 0);
+        struct tar_header *h = (struct tar_header *) disk_buf;
+        
+        if (h->name[0] == '\0') {
+            break;
+        }
+        
+        if (strcmp(h->name, filename) == 0) {
+            // Found it! Data starts at next sector
+            sector++;
+            break;
+        }
+        
+        unsigned fs = oct2int(h->size, sizeof(h->size));
+        unsigned data_sectors = (fs + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        sector += 1 + data_sectors;
+    }
+    
+    // Read file data
+    unsigned bytes_read = 0;
+    while (bytes_read < file_size) {
+        read_write_disk(disk_buf, sector, 0);
+        
+        unsigned bytes_to_copy = file_size - bytes_read;
+        if (bytes_to_copy > SECTOR_SIZE) {
+            bytes_to_copy = SECTOR_SIZE;
+        }
+        
+        memcpy(buf + bytes_read, disk_buf, bytes_to_copy);
+        bytes_read += bytes_to_copy;
+        sector++;
+    }
+    
+    // Null terminate if space available
+    if (bytes_read < (unsigned)size) {
+        buf[bytes_read] = '\0';
+    }
+}
 
 // Global virtio-blk state pointers
 struct virtio_virtq *blk_request_vq;
@@ -627,27 +783,31 @@ void kernel_main(void) {
     // Initialize virtio-blk driver
     virtio_blk_init();
     
-    // Test: Write and read back data
-    printf("Testing disk I/O...\n");
+    // Initialize tar file system
+    fs_init();
     
-    char write_buf[SECTOR_SIZE];
-    char read_buf[SECTOR_SIZE];
+    // Demonstrate tar file system functionality
+    printf("\n=== TAR File System Demonstration ===\n");
+    printf("\n1. Listing all files in archive:\n");
+    fs_list_files();
     
-    // Write test data
-    strcpy(write_buf, "Hello from virtio-blk!");
-    printf("Writing: %s\n", write_buf);
-    read_write_disk(write_buf, 0, 1);  // Write to sector 0
+    printf("\n2. Reading 'hello.txt':\n");
+    char file_buf[512];
+    memset(file_buf, 0, sizeof(file_buf));
+    fs_read_file("hello.txt", file_buf, sizeof(file_buf));
+    printf("   Content: %s\n", file_buf);
     
-    // Read back
-    memset(read_buf, 0, SECTOR_SIZE);
-    read_write_disk(read_buf, 0, 0);  // Read from sector 0
-    printf("Read back: %s\n", read_buf);
+    printf("\n3. Reading 'test.txt':\n");
+    memset(file_buf, 0, sizeof(file_buf));
+    fs_read_file("test.txt", file_buf, sizeof(file_buf));
+    printf("   Content: %s\n", file_buf);
     
-    if (strcmp(write_buf, read_buf) == 0) {
-        printf("Disk I/O test: OK\n");
-    } else {
-        printf("Disk I/O test: FAILED\n");
-    }
+    printf("\n4. Reading 'another.txt':\n");
+    memset(file_buf, 0, sizeof(file_buf));
+    fs_read_file("another.txt", file_buf, sizeof(file_buf));
+    printf("   Content: %s\n", file_buf);
+    
+    printf("\n=== TAR File System Test Complete ===\n\n");
 
     idle_proc = create_process((uint32_t) idle_entry);
     idle_proc->pid = 0;

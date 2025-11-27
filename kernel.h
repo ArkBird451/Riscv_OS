@@ -160,3 +160,33 @@ struct virtio_blk_req {
     uint8_t data[512];
     uint8_t status;
 } __attribute__((packed));
+
+// Tar file system structures
+#define TAR_SECTOR_SIZE 512
+#define TAR_NAME_SIZE   100
+
+struct tar_header {
+    char name[TAR_NAME_SIZE];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char type;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+} __attribute__((packed));
+
+// File system functions
+void fs_init(void);
+void fs_list_files(void);
+struct tar_header *fs_lookup(const char *filename);
+void fs_read_file(const char *filename, char *buf, int size);
